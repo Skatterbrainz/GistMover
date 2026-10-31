@@ -23,12 +23,15 @@ import time
 from urllib.parse import quote
 
 import requests
-from PySide6.QtCore import Qt, QThread, Signal
+from PySide6.QtCore import Qt, QThread, QUrl, Signal
+from PySide6.QtGui import QDesktopServices, QFontDatabase
 from PySide6.QtWidgets import (
-    QApplication, QCheckBox, QHBoxLayout, QInputDialog, QLabel, QLineEdit,
-    QListWidget, QListWidgetItem, QMainWindow, QMessageBox, QPlainTextEdit,
+    QApplication, QCheckBox, QDialog, QHBoxLayout, QInputDialog, QLabel, QLineEdit,
+    QListWidget, QListWidgetItem, QMainWindow, QMenu, QMessageBox, QPlainTextEdit,
     QPushButton, QSplitter, QTreeWidget, QTreeWidgetItem, QVBoxLayout, QWidget,
 )
+
+MAX_VIEW_CHARS = 200_000        # the viewer shows at most this much of a file (Qt chokes on huge texts)
 
 API = "https://api.github.com"
 
@@ -338,6 +341,8 @@ class MainWindow(QMainWindow):
         self.gist_tree = QTreeWidget()
         self.gist_tree.setHeaderLabels(["Gists and files", "Size"])
         self.gist_tree.setColumnWidth(0, 450)
+        self.gist_tree.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.gist_tree.customContextMenuRequested.connect(self.gist_context_menu)
         btn_all = QPushButton("Check visible")
         btn_all.clicked.connect(lambda: self.set_visible_checked(Qt.Checked))
         btn_none = QPushButton("Uncheck all")
@@ -480,7 +485,8 @@ class MainWindow(QMainWindow):
             top.setFlags(top.flags() | Qt.ItemIsUserCheckable | Qt.ItemIsAutoTristate)
             top.setCheckState(0, Qt.Unchecked)
             top.setToolTip(0, f"{g['id']}\n{g.get('html_url', '')}")
-            top.setData(0, Qt.UserRole, {"id": g["id"], "desc": desc, "label": label})
+            top.setData(0, Qt.UserRole, {"id": g["id"], "desc": desc, "label": label,
+                                         "url": g.get("html_url") or f"https://gist.github.com/{g['id']}"})
             for name, f in sorted(files.items()):
                 child = QTreeWidgetItem([name, f"{f.get('size', 0):,}"])
                 child.setFlags(child.flags() | Qt.ItemIsUserCheckable)
@@ -681,6 +687,63 @@ class MainWindow(QMainWindow):
         self.say(f"Done: {ok} moved, {skipped} skipped, {failed} failed.")
         self.statusBar().showMessage(f"{ok} moved, {skipped} skipped, {failed} failed")
         self.on_repo_selected(self.repo_list.currentItem())   # refresh folder list
+
+    # ------------------------------------------------------------ viewing
+    def gist_context_menu(self, pos):
+        item = self.gist_tree.itemAt(pos)
+        if item is None:
+            return
+        menu = QMenu(self)
+        top = item.parent() or item
+        if item.parent() is not None:
+            menu.addAction("View Contents", lambda: self.view_file(item))
+        url = top.data(0, Qt.UserRole)["url"]
+        menu.addAction("Open gist on GitHub", lambda: QDesktopServices.openUrl(QUrl(url)))
+        menu.exec(self.gist_tree.viewport().mapToGlobal(pos))
+
+    def view_file(self, item):
+        d = item.data(0, Qt.UserRole)
+        name, raw_url = d["name"], d["raw_url"]
+        label = item.parent().data(0, Qt.UserRole)["label"]
+        self.statusBar().showMessage(f"Loading {name}...")
+
+        def show(data):
+            self.statusBar().showMessage("Ready")
+            self.show_viewer(f"{name} — {label}", data)
+
+        self.run_task(lambda: self.gh.raw(raw_url), show,
+                      lambda m: (self.statusBar().showMessage("Ready"), self.say(f"ERROR {m}")))
+
+    def show_viewer(self, title, data):
+        try:
+            text = data.decode("utf-8")
+        except UnicodeDecodeError:
+            text = f"(binary file, {len(data):,} bytes - cannot be shown as text)"
+        else:
+            if len(text) > MAX_VIEW_CHARS:
+                text = (text[:MAX_VIEW_CHARS]
+                        + f"\n\n... truncated; showing the first {MAX_VIEW_CHARS:,} of {len(text):,} characters")
+        dlg = QDialog(self)
+        dlg.setObjectName("viewer")
+        dlg.setWindowTitle(title)
+        dlg.setAttribute(Qt.WA_DeleteOnClose)
+        dlg.resize(900, 650)
+        edit = QPlainTextEdit(readOnly=True)
+        edit.setFont(QFontDatabase.systemFont(QFontDatabase.FixedFont))
+        edit.setLineWrapMode(QPlainTextEdit.NoWrap)
+        edit.setPlainText(text)
+        copy = QPushButton("Copy")
+        copy.clicked.connect(lambda: QApplication.clipboard().setText(text))
+        close = QPushButton("Close")
+        close.clicked.connect(dlg.close)
+        lay = QVBoxLayout(dlg)
+        lay.addWidget(edit)
+        row = QHBoxLayout()
+        row.addStretch()
+        row.addWidget(copy)
+        row.addWidget(close)
+        lay.addLayout(row)
+        dlg.show()            # non-modal: you can open several and keep working
 
     # ------------------------------------------------------------ deleting
     def planned_deletes(self):
