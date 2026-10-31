@@ -15,6 +15,7 @@ then a password prompt. The token needs the `gist` and `repo` scopes
 (classic PAT, or the token from `gh auth login`).
 """
 import base64
+import hashlib
 import os
 import subprocess
 import sys
@@ -137,6 +138,11 @@ class GitHub:
         self._req("DELETE", f"/gists/{gist_id}")
 
 
+def blob_sha(data: bytes) -> str:
+    """Git blob SHA-1 of the content, comparable to the `sha` GitHub reports for a repo file."""
+    return hashlib.sha1(b"blob %d\0" % len(data) + data).hexdigest()
+
+
 def get_token(parent=None):
     for var in ("GITHUB_TOKEN", "GH_TOKEN"):
         if os.environ.get(var):
@@ -172,19 +178,43 @@ class Task(QThread):
 class MoveWorker(QThread):
     log = Signal(str)
     moved = Signal(str, str, bool)      # gist_id, filename, removed_from_gist
+    deleted = Signal(str, object)       # gist_id, filename (None = whole gist deleted)
     pr_created = Signal(str)            # pull request URL
     finished_counts = Signal(int, int, int)
 
-    def __init__(self, gh, jobs, repo, branch, folder, overwrite, delete_src, as_pr=False):
+    def __init__(self, gh, jobs, repo, branch, folder, overwrite, delete_src, as_pr=False,
+                 gist_sizes=None):
         super().__init__()
         self.gh, self.jobs, self.repo, self.branch = gh, jobs, repo, branch
         self.folder, self.overwrite, self.delete_src = folder, overwrite, delete_src
         self.as_pr = as_pr
+        self.gist_sizes = gist_sizes or {}      # gist_id -> total number of files in that gist
+
+    def remove_copied(self, copied):
+        """Remove copied files from their gists. A gist whose files were ALL copied is deleted
+        outright, because GitHub refuses to remove the last remaining file of a gist."""
+        for gid, names in copied.items():
+            if len(set(names)) >= self.gist_sizes.get(gid, 10 ** 9):
+                try:
+                    self.gh.delete_gist(gid)
+                    self.log.emit(f"      deleted gist {gid[:7]} (all {len(names)} file(s) copied)")
+                    self.deleted.emit(gid, None)
+                except GitHubError as e:
+                    self.log.emit(f"WARN  copied, but could not delete gist {gid[:7]}: {e}")
+                continue
+            for name in names:
+                try:
+                    self.gh.remove_from_gist(gid, name)
+                    self.log.emit(f"      removed {name} from gist {gid[:7]}")
+                    self.deleted.emit(gid, name)
+                except GitHubError as e:
+                    self.log.emit(f"WARN  copied, but could not remove {name} from gist {gid[:7]}: {e}")
 
     def run(self):
         ok = skipped = failed = 0
         pr_branch = None
         committed = []                  # (target_path, gist_id) for the PR body
+        copied = {}                     # gist_id -> filenames that are now safely in the repo
         for job in self.jobs:
             if self.isInterruptionRequested():
                 self.log.emit("Stopped.")
@@ -193,11 +223,22 @@ class MoveWorker(QThread):
             target = f"{self.folder}/{name}" if self.folder else name
             try:
                 sha = self.gh.get_sha(self.repo, target, self.branch)   # looked up on the base branch
-                if sha and not self.overwrite:
-                    self.log.emit(f"SKIP  {name} -> {target} (already exists)")
-                    skipped += 1
-                    continue
-                data = self.gh.raw(raw_url)
+                data = None
+                if sha:
+                    data = self.gh.raw(raw_url)
+                    if blob_sha(data) == sha:       # already in the repo, byte for byte
+                        self.log.emit(f"SKIP  {name} -> {target} (already in repo, identical)")
+                        skipped += 1
+                        copied.setdefault(gid, []).append(name)
+                        self.moved.emit(gid, name, False)
+                        continue
+                    if not self.overwrite:
+                        self.log.emit(f"SKIP  {name} -> {target} "
+                                      "(exists and differs; tick Overwrite to replace it)")
+                        skipped += 1
+                        continue
+                if data is None:
+                    data = self.gh.raw(raw_url)
                 if self.as_pr and pr_branch is None:
                     base_sha = self.gh.branch_sha(self.repo, self.branch)
                     pr_branch = "gist-move-" + time.strftime("%Y%m%d-%H%M%S")
@@ -213,18 +254,14 @@ class MoveWorker(QThread):
                 self.log.emit(f"OK    {name} -> {where}/{target}")
                 ok += 1
                 committed.append((target, gid))
-                removed = False
-                if self.delete_src and not self.as_pr:
-                    try:
-                        self.gh.remove_from_gist(gid, name)
-                        removed = True
-                        self.log.emit(f"      removed {name} from gist {gid[:7]}")
-                    except GitHubError as e:
-                        self.log.emit(f"WARN  copied, but could not remove from gist: {e}")
-                self.moved.emit(gid, name, removed)
+                copied.setdefault(gid, []).append(name)
+                self.moved.emit(gid, name, False)
             except Exception as e:  # noqa: BLE001
                 self.log.emit(f"FAIL  {name}: {e}")
                 failed += 1
+
+        if self.delete_src and not self.as_pr and copied:
+            self.remove_copied(copied)
 
         if self.as_pr and pr_branch and committed:
             try:
@@ -411,8 +448,11 @@ class MainWindow(QMainWindow):
 
     def on_pr_toggled(self, on):
         if on:
+            self._delete_src_prev = self.delete_src.isChecked()
             self.delete_src.setChecked(False)
         self.delete_src.setEnabled(not on)
+        if not on:                                  # restore what the user had ticked
+            self.delete_src.setChecked(getattr(self, "_delete_src_prev", False))
         self.delete_src.setToolTip("Not available in pull-request mode: the files only exist in the "
                                    "PR until it is merged. Use 'Delete checked...' after merging."
                                    if on else "")
@@ -592,15 +632,22 @@ class MainWindow(QMainWindow):
         else:
             text = f"Copy {len(jobs)} file(s) to {dest}?"
             if self.delete_src.isChecked():
-                text += "\n\nEach file will also be REMOVED from its gist."
+                text += ("\n\nCopied files will also be REMOVED from their gists "
+                         "(a gist whose files are all copied is deleted).")
         if QMessageBox.question(self, "Confirm", text) != QMessageBox.Yes:
             return
         self.pr_link.setText("")
+        sizes = {}
+        for i in range(self.gist_tree.topLevelItemCount()):
+            t = self.gist_tree.topLevelItem(i)
+            sizes[t.data(0, Qt.UserRole)["id"]] = t.childCount()
         self.set_busy(True)
         self.worker = MoveWorker(self.gh, jobs, self.cur_repo, self.cur_branch, folder,
-                                 self.overwrite.isChecked(), self.delete_src.isChecked(), as_pr)
+                                 self.overwrite.isChecked(), self.delete_src.isChecked(), as_pr,
+                                 sizes)
         self.worker.log.connect(self.say)
         self.worker.moved.connect(self.on_moved)
+        self.worker.deleted.connect(self.on_deleted)
         self.worker.pr_created.connect(self.on_pr_created)
         self.worker.finished_counts.connect(self.on_finished)
         self.worker.start()
