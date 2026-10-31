@@ -1,0 +1,27 @@
+# Virtual environment (the one you created with python3 -m venv)
+venv/
+.venv/
+env/
+
+# Python bytecode / compilation output
+__pycache__/
+*.py[cod]
+
+# Secrets, in case you ever save a token locally
+.env
+.env.*
+*.token
+*.pem
+*.key
+
+# Packaging / build output (only if you later build a package)
+build/
+dist/
+*.egg-info/
+
+# Editor / OS noise
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
