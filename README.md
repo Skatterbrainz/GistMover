@@ -36,5 +36,8 @@ filtered-out (hidden) files are never included. Deleted gists cannot be restored
 
 - Gist revision history is not carried over (one new commit per file). To keep history, clone the gist and push it instead.
 - Existing files are skipped unless "Overwrite" is ticked.
-- A gist cannot be emptied through the API, so removing a gist's last file will warn; delete that gist on github.com.
+- "Remove file from the gist after copying" runs after the whole batch. If every file of a gist was copied
+  (GitHub won't remove a gist's last file), the gist itself is deleted; otherwise only the copied files are removed.
+- A file already in the repo with identical content counts as copied (so re-running cleans up the gist);
+  one that exists but differs is skipped and kept in the gist unless you tick Overwrite.
 - Files are copied from the gist's latest version.
