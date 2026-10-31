@@ -1,10 +1,14 @@
 #!/usr/bin/env python3
 """Gist Mover - move individual GitHub gist files into a repo folder.
 
-Left panel : your gists and their files (tick the files to move)
+Left panel : your gists and their files (tick the files to move or delete)
 Right panel: your repos (writable ones), the repo's folders, target folder box
-Move       : copies each ticked file to <repo>/<folder>/<filename> as one commit
-             per file, optionally removing it from the gist afterwards.
+Move       : copies each ticked file to <repo>/<folder>/<filename>, either as one
+             commit per file on the default branch, or on a new branch with a
+             pull request. Optionally removes each file from its gist afterwards
+             (direct-commit mode only).
+Delete     : permanently deletes ticked files from their gists. If every file of
+             a gist is ticked, the whole gist is deleted.
 
 Auth (first match wins): GITHUB_TOKEN / GH_TOKEN env var, `gh auth token`,
 then a password prompt. The token needs the `gist` and `repo` scopes
@@ -14,6 +18,7 @@ import base64
 import os
 import subprocess
 import sys
+import time
 from urllib.parse import quote
 
 import requests
@@ -112,8 +117,24 @@ class GitHub:
             body["sha"] = sha
         self._req("PUT", f"/repos/{full}/contents/{quote(path)}", json=body)
 
+    # ---- pull requests
+    def branch_sha(self, full, branch):
+        return self._req("GET", f"/repos/{full}/git/ref/heads/{quote(branch, safe='/')}"
+                         ).json()["object"]["sha"]
+
+    def create_branch(self, full, name, sha):
+        self._req("POST", f"/repos/{full}/git/refs", json={"ref": f"refs/heads/{name}", "sha": sha})
+
+    def create_pr(self, full, title, head, base, body):
+        return self._req("POST", f"/repos/{full}/pulls", json={
+            "title": title, "head": head, "base": base, "body": body}).json()["html_url"]
+
+    # ---- gist deletes
     def remove_from_gist(self, gist_id, filename):
         self._req("PATCH", f"/gists/{gist_id}", json={"files": {filename: None}})
+
+    def delete_gist(self, gist_id):
+        self._req("DELETE", f"/gists/{gist_id}")
 
 
 def get_token(parent=None):
@@ -151,15 +172,19 @@ class Task(QThread):
 class MoveWorker(QThread):
     log = Signal(str)
     moved = Signal(str, str, bool)      # gist_id, filename, removed_from_gist
+    pr_created = Signal(str)            # pull request URL
     finished_counts = Signal(int, int, int)
 
-    def __init__(self, gh, jobs, repo, branch, folder, overwrite, delete_src):
+    def __init__(self, gh, jobs, repo, branch, folder, overwrite, delete_src, as_pr=False):
         super().__init__()
         self.gh, self.jobs, self.repo, self.branch = gh, jobs, repo, branch
         self.folder, self.overwrite, self.delete_src = folder, overwrite, delete_src
+        self.as_pr = as_pr
 
     def run(self):
         ok = skipped = failed = 0
+        pr_branch = None
+        committed = []                  # (target_path, gist_id) for the PR body
         for job in self.jobs:
             if self.isInterruptionRequested():
                 self.log.emit("Stopped.")
@@ -167,21 +192,29 @@ class MoveWorker(QThread):
             gid, desc, name, raw_url = job["id"], job["desc"], job["name"], job["raw_url"]
             target = f"{self.folder}/{name}" if self.folder else name
             try:
-                sha = self.gh.get_sha(self.repo, target, self.branch)
+                sha = self.gh.get_sha(self.repo, target, self.branch)   # looked up on the base branch
                 if sha and not self.overwrite:
                     self.log.emit(f"SKIP  {name} -> {target} (already exists)")
                     skipped += 1
                     continue
                 data = self.gh.raw(raw_url)
+                if self.as_pr and pr_branch is None:
+                    base_sha = self.gh.branch_sha(self.repo, self.branch)
+                    pr_branch = "gist-move-" + time.strftime("%Y%m%d-%H%M%S")
+                    self.gh.create_branch(self.repo, pr_branch, base_sha)
+                    self.log.emit(f"      created branch {pr_branch}")
+                commit_branch = pr_branch if self.as_pr else self.branch
                 msg = f"Move {name} from gist {gid[:7]}"
                 if desc:
                     msg += f"\n\n{desc}"
                 msg += f"\n\nSource: https://gist.github.com/{gid}"
-                self.gh.put_file(self.repo, target, data, msg, self.branch, sha)
-                self.log.emit(f"OK    {name} -> {self.repo}/{target}")
+                self.gh.put_file(self.repo, target, data, msg, commit_branch, sha)
+                where = f"{self.repo}@{pr_branch}" if self.as_pr else self.repo
+                self.log.emit(f"OK    {name} -> {where}/{target}")
                 ok += 1
+                committed.append((target, gid))
                 removed = False
-                if self.delete_src:
+                if self.delete_src and not self.as_pr:
                     try:
                         self.gh.remove_from_gist(gid, name)
                         removed = True
@@ -192,7 +225,62 @@ class MoveWorker(QThread):
             except Exception as e:  # noqa: BLE001
                 self.log.emit(f"FAIL  {name}: {e}")
                 failed += 1
+
+        if self.as_pr and pr_branch and committed:
+            try:
+                if len(committed) == 1:
+                    title = f"Move {os.path.basename(committed[0][0])} from gist {committed[0][1][:7]}"
+                else:
+                    title = f"Move {len(committed)} files from gists"
+                body = "Files moved from GitHub gists:\n\n" + "\n".join(
+                    f"- `{t}` (from https://gist.github.com/{g})" for t, g in committed)
+                url = self.gh.create_pr(self.repo, title, pr_branch, self.branch, body)
+                self.log.emit(f"PR    {url}")
+                self.pr_created.emit(url)
+            except Exception as e:  # noqa: BLE001
+                self.log.emit(f"FAIL  files were pushed to branch {pr_branch}, "
+                              f"but the pull request could not be created: {e}")
         self.finished_counts.emit(ok, skipped, failed)
+
+
+class DeleteWorker(QThread):
+    log = Signal(str)
+    deleted = Signal(str, object)       # gist_id, filename (None = whole gist)
+    finished_counts = Signal(int, int)
+
+    def __init__(self, gh, whole, partial):
+        super().__init__()
+        self.gh, self.whole, self.partial = gh, whole, partial
+
+    def run(self):
+        ok = failed = 0
+        for gid, _desc, files in self.whole:
+            if self.isInterruptionRequested():
+                self.log.emit("Stopped.")
+                break
+            try:
+                self.gh.delete_gist(gid)
+                self.log.emit(f"DEL   gist {gid[:7]} ({len(files)} file(s))")
+                self.deleted.emit(gid, None)
+                ok += 1
+            except Exception as e:  # noqa: BLE001
+                self.log.emit(f"FAIL  delete gist {gid[:7]}: {e}")
+                failed += 1
+        for gid, _desc, files in self.partial:
+            for name in files:
+                if self.isInterruptionRequested():
+                    self.log.emit("Stopped.")
+                    self.finished_counts.emit(ok, failed)
+                    return
+                try:
+                    self.gh.remove_from_gist(gid, name)
+                    self.log.emit(f"DEL   {name} from gist {gid[:7]}")
+                    self.deleted.emit(gid, name)
+                    ok += 1
+                except Exception as e:  # noqa: BLE001
+                    self.log.emit(f"FAIL  delete {name} from gist {gid[:7]}: {e}")
+                    failed += 1
+        self.finished_counts.emit(ok, failed)
 
 
 class MainWindow(QMainWindow):
@@ -205,7 +293,7 @@ class MainWindow(QMainWindow):
         self._tasks = set()
         self.worker = None
         self.setWindowTitle("Gist Mover")
-        self.resize(1250, 800)
+        self.resize(1250, 820)
 
         # ---- left: gists
         self.gist_filter = QLineEdit(placeholderText="Filter gists / files...")
@@ -217,8 +305,13 @@ class MainWindow(QMainWindow):
         btn_all.clicked.connect(lambda: self.set_visible_checked(Qt.Checked))
         btn_none = QPushButton("Uncheck all")
         btn_none.clicked.connect(lambda: self.set_visible_checked(Qt.Unchecked, everything=True))
-        btn_reload = QPushButton("Reload")
-        btn_reload.clicked.connect(self.load_all)
+        self.reload_btn = QPushButton("Reload")
+        self.reload_btn.clicked.connect(self.load_all)
+        self.delete_btn = QPushButton("Delete checked...")
+        self.delete_btn.setStyleSheet("color: #d32f2f; font-weight: bold;")
+        self.delete_btn.setToolTip("Permanently delete the checked files from their gists.\n"
+                                   "If all files of a gist are checked, the whole gist is deleted.")
+        self.delete_btn.clicked.connect(self.do_delete)
         self.gist_count = QLabel("")
         left = QWidget()
         lv = QVBoxLayout(left)
@@ -226,7 +319,7 @@ class MainWindow(QMainWindow):
         lv.addWidget(self.gist_filter)
         lv.addWidget(self.gist_tree)
         row = QHBoxLayout()
-        for w in (btn_all, btn_none, btn_reload):
+        for w in (btn_all, btn_none, self.reload_btn, self.delete_btn):
             row.addWidget(w)
         row.addStretch()
         row.addWidget(self.gist_count)
@@ -240,18 +333,26 @@ class MainWindow(QMainWindow):
         self.private_only.toggled.connect(self.apply_repo_filter)
         self.repo_list = QListWidget()
         self.repo_list.currentItemChanged.connect(self.on_repo_selected)
+        self.repo_link = QLabel("")
+        self.repo_link.setOpenExternalLinks(True)
+        self.repo_link.setTextInteractionFlags(Qt.TextBrowserInteraction)
         self.folder_tree = QTreeWidget()
         self.folder_tree.setHeaderLabels(["Folders in selected repo"])
         self.folder_tree.currentItemChanged.connect(self.on_folder_selected)
         self.folder_edit = QLineEdit(placeholderText="Target folder (blank = repo root; new folders are fine)")
         self.overwrite = QCheckBox("Overwrite files that already exist in the repo")
+        self.as_pr = QCheckBox("Submit as a pull request (new branch) instead of committing directly")
+        self.as_pr.toggled.connect(self.on_pr_toggled)
         self.delete_src = QCheckBox("Remove file from the gist after a successful copy")
-        self.move_btn = QPushButton("Move checked files  \u2192")
+        self.move_btn = QPushButton("Move checked files  →")
         self.move_btn.setStyleSheet("font-weight: bold; padding: 8px;")
         self.move_btn.clicked.connect(self.do_move)
         self.stop_btn = QPushButton("Stop")
         self.stop_btn.setEnabled(False)
         self.stop_btn.clicked.connect(lambda: self.worker and self.worker.requestInterruption())
+        self.pr_link = QLabel("")
+        self.pr_link.setOpenExternalLinks(True)
+        self.pr_link.setTextInteractionFlags(Qt.TextBrowserInteraction)
         right = QWidget()
         rv = QVBoxLayout(right)
         rv.addWidget(QLabel("<b>Repositories</b>"))
@@ -260,14 +361,17 @@ class MainWindow(QMainWindow):
         rr.addWidget(self.private_only)
         rv.addLayout(rr)
         rv.addWidget(self.repo_list, 3)
+        rv.addWidget(self.repo_link)
         rv.addWidget(self.folder_tree, 3)
         rv.addWidget(self.folder_edit)
         rv.addWidget(self.overwrite)
+        rv.addWidget(self.as_pr)
         rv.addWidget(self.delete_src)
         mr = QHBoxLayout()
         mr.addWidget(self.move_btn, 1)
         mr.addWidget(self.stop_btn)
         rv.addLayout(mr)
+        rv.addWidget(self.pr_link)
 
         top = QSplitter(Qt.Horizontal)
         top.addWidget(left)
@@ -295,17 +399,37 @@ class MainWindow(QMainWindow):
     def say(self, text):
         self.log.appendPlainText(text)
 
+    def set_busy(self, busy):
+        for b in (self.move_btn, self.delete_btn, self.reload_btn):
+            b.setEnabled(not busy)
+        self.stop_btn.setEnabled(busy)
+
+    def update_gist_count(self):
+        n = self.gist_tree.topLevelItemCount()
+        files = sum(self.gist_tree.topLevelItem(i).childCount() for i in range(n))
+        self.gist_count.setText(f"{n} gists, {files} files")
+
+    def on_pr_toggled(self, on):
+        if on:
+            self.delete_src.setChecked(False)
+        self.delete_src.setEnabled(not on)
+        self.delete_src.setToolTip("Not available in pull-request mode: the files only exist in the "
+                                   "PR until it is merged. Use 'Delete checked...' after merging."
+                                   if on else "")
+        self.move_btn.setText("Move checked files as PR  →" if on else "Move checked files  →")
+
     # ------------------------------------------------------------ loading
     def load_all(self):
         self.statusBar().showMessage("Loading gists and repos...")
         self.gist_tree.clear()
+        self.repo_list.blockSignals(True)     # clear() would otherwise "select" a neighbour repo
         self.repo_list.clear()
+        self.repo_list.blockSignals(False)
         self.run_task(self.gh.gists, self.fill_gists)
         self.run_task(self.gh.repos, self.fill_repos)
 
     def fill_gists(self, gists):
         self.gist_tree.clear()
-        nfiles = 0
         for g in gists:
             desc = g.get("description") or ""
             vis = "public" if g.get("public") else "secret"
@@ -316,16 +440,15 @@ class MainWindow(QMainWindow):
             top.setFlags(top.flags() | Qt.ItemIsUserCheckable | Qt.ItemIsAutoTristate)
             top.setCheckState(0, Qt.Unchecked)
             top.setToolTip(0, f"{g['id']}\n{g.get('html_url', '')}")
-            top.setData(0, Qt.UserRole, {"id": g["id"], "desc": desc})
+            top.setData(0, Qt.UserRole, {"id": g["id"], "desc": desc, "label": label})
             for name, f in sorted(files.items()):
                 child = QTreeWidgetItem([name, f"{f.get('size', 0):,}"])
                 child.setFlags(child.flags() | Qt.ItemIsUserCheckable)
                 child.setCheckState(0, Qt.Unchecked)
                 child.setData(0, Qt.UserRole, {"name": name, "raw_url": f["raw_url"]})
                 top.addChild(child)
-                nfiles += 1
             self.gist_tree.addTopLevelItem(top)
-        self.gist_count.setText(f"{len(gists)} gists, {nfiles} files")
+        self.update_gist_count()
         self.apply_gist_filter()
         self.statusBar().showMessage("Ready")
 
@@ -352,8 +475,10 @@ class MainWindow(QMainWindow):
     def apply_repo_filter(self):
         q = self.repo_filter.text().strip().lower()
         priv = self.private_only.isChecked()
+        keep = self.cur_repo
         self.repo_list.blockSignals(True)
         self.repo_list.clear()
+        match = -1
         for r in self.repos:
             if priv and not r.get("private"):
                 continue
@@ -362,7 +487,15 @@ class MainWindow(QMainWindow):
             it = QListWidgetItem(r["full_name"] + ("  \U0001F512" if r.get("private") else ""))
             it.setData(Qt.UserRole, r)
             self.repo_list.addItem(it)
+            if r["full_name"] == keep:
+                match = self.repo_list.count() - 1
+        if match >= 0:
+            self.repo_list.setCurrentRow(match)      # keep the highlighted target in sync
         self.repo_list.blockSignals(False)
+        if keep and match < 0:                        # target no longer visible: forget it
+            self.cur_repo = self.cur_branch = None
+            self.repo_link.setText("")
+            self.folder_tree.clear()
 
     def set_visible_checked(self, state, everything=False):
         for i in range(self.gist_tree.topLevelItemCount()):
@@ -381,8 +514,11 @@ class MainWindow(QMainWindow):
         r = item.data(Qt.UserRole)
         if r["full_name"] != self.cur_repo:      # keep the typed folder when just refreshing
             self.folder_edit.clear()
+            self.pr_link.setText("")
         self.cur_repo = r["full_name"]
         self.cur_branch = r.get("default_branch") or "main"
+        url = r.get("html_url") or f"https://github.com/{self.cur_repo}"
+        self.repo_link.setText(f'<a href="{url}">Open {self.cur_repo} on GitHub</a>')
         self.folder_tree.clear()
         self.statusBar().showMessage(f"Loading folders of {self.cur_repo}...")
         full, branch = self.cur_repo, self.cur_branch
@@ -393,7 +529,8 @@ class MainWindow(QMainWindow):
             if dirs is None:
                 self.cur_branch = None      # empty repo: let GitHub create the branch
                 dirs = []
-                self.say(f"{full} is empty; first commit will create its default branch.")
+                self.say(f"{full} is empty; first commit will create its default branch "
+                         "(pull-request mode is unavailable until then).")
             self.populate_folders(dirs)
             self.statusBar().showMessage("Ready")
 
@@ -442,43 +579,123 @@ class MainWindow(QMainWindow):
         if not self.cur_repo:
             QMessageBox.information(self, "No repo", "Select a target repository first.")
             return
+        as_pr = self.as_pr.isChecked()
+        if as_pr and not self.cur_branch:
+            QMessageBox.warning(self, "Empty repository",
+                                "This repo has no commits yet, so a pull request is impossible. "
+                                "Untick the pull-request option for the first commit.")
+            return
         folder = self.folder_edit.text().strip().strip("/")
         dest = f"{self.cur_repo}/{folder}" if folder else self.cur_repo
-        extra = "\n\nEach file will also be REMOVED from its gist." if self.delete_src.isChecked() else ""
-        if QMessageBox.question(
-                self, "Confirm",
-                f"Copy {len(jobs)} file(s) to {dest}?{extra}") != QMessageBox.Yes:
+        if as_pr:
+            text = f"Copy {len(jobs)} file(s) to {dest} on a new branch and open a pull request?"
+        else:
+            text = f"Copy {len(jobs)} file(s) to {dest}?"
+            if self.delete_src.isChecked():
+                text += "\n\nEach file will also be REMOVED from its gist."
+        if QMessageBox.question(self, "Confirm", text) != QMessageBox.Yes:
             return
-        self.move_btn.setEnabled(False)
-        self.stop_btn.setEnabled(True)
+        self.pr_link.setText("")
+        self.set_busy(True)
         self.worker = MoveWorker(self.gh, jobs, self.cur_repo, self.cur_branch, folder,
-                                 self.overwrite.isChecked(), self.delete_src.isChecked())
+                                 self.overwrite.isChecked(), self.delete_src.isChecked(), as_pr)
         self.worker.log.connect(self.say)
         self.worker.moved.connect(self.on_moved)
+        self.worker.pr_created.connect(self.on_pr_created)
         self.worker.finished_counts.connect(self.on_finished)
         self.worker.start()
 
-    def on_moved(self, gist_id, name, removed):
+    def on_pr_created(self, url):
+        self.pr_link.setText(f'<a href="{url}">Open pull request on GitHub</a>')
+
+    def find_gist(self, gist_id):
         for i in range(self.gist_tree.topLevelItemCount()):
             top = self.gist_tree.topLevelItem(i)
-            if top.data(0, Qt.UserRole)["id"] != gist_id:
-                continue
-            for j in range(top.childCount()):
-                c = top.child(j)
-                if c.data(0, Qt.UserRole)["name"] == name:
-                    if removed:
-                        top.removeChild(c)
-                    else:
-                        c.setCheckState(0, Qt.Unchecked)
-                    break
-            break
+            if top.data(0, Qt.UserRole)["id"] == gist_id:
+                return i, top
+        return -1, None
+
+    def on_moved(self, gist_id, name, removed):
+        _, top = self.find_gist(gist_id)
+        if top is None:
+            return
+        for j in range(top.childCount()):
+            c = top.child(j)
+            if c.data(0, Qt.UserRole)["name"] == name:
+                if removed:
+                    top.removeChild(c)
+                else:
+                    c.setCheckState(0, Qt.Unchecked)
+                break
+        self.update_gist_count()
 
     def on_finished(self, ok, skipped, failed):
-        self.move_btn.setEnabled(True)
-        self.stop_btn.setEnabled(False)
+        self.set_busy(False)
         self.say(f"Done: {ok} moved, {skipped} skipped, {failed} failed.")
         self.statusBar().showMessage(f"{ok} moved, {skipped} skipped, {failed} failed")
         self.on_repo_selected(self.repo_list.currentItem())   # refresh folder list
+
+    # ------------------------------------------------------------ deleting
+    def planned_deletes(self):
+        """-> (whole_gists, partial) as lists of (gist_id, label, [filenames])."""
+        by_gist = {}
+        for j in self.checked_jobs():
+            by_gist.setdefault(j["id"], []).append(j["name"])
+        whole, partial = [], []
+        for i in range(self.gist_tree.topLevelItemCount()):
+            top = self.gist_tree.topLevelItem(i)
+            meta = top.data(0, Qt.UserRole)
+            files = by_gist.get(meta["id"])
+            if not files:
+                continue
+            # only a gist with ALL its files checked (none hidden by a filter) is deleted whole
+            (whole if len(files) == top.childCount() else partial).append(
+                (meta["id"], meta["label"], files))
+        return whole, partial
+
+    def do_delete(self):
+        whole, partial = self.planned_deletes()
+        if not whole and not partial:
+            QMessageBox.information(self, "Nothing to delete", "Check at least one gist file first.")
+            return
+        lines = []
+        if whole:
+            lines.append(f"DELETE {len(whole)} ENTIRE gist(s):")
+            lines += [f"  • {label}  ({len(files)} file(s))" for _g, label, files in whole]
+        if partial:
+            n = sum(len(f) for _g, _l, f in partial)
+            lines.append(f"Remove {n} file(s) from {len(partial)} gist(s):")
+            lines += [f"  • {name}   in {label}" for _g, label, files in partial for name in files]
+        if len(lines) > 14:
+            lines = lines[:14] + [f"  ... and {len(lines) - 14} more line(s)"]
+        text = "\n".join(lines) + "\n\nThis permanently deletes them from GitHub and cannot be undone."
+        if QMessageBox.question(self, "Delete from GitHub", text,
+                                QMessageBox.Yes | QMessageBox.No, QMessageBox.No) != QMessageBox.Yes:
+            return
+        self.set_busy(True)
+        self.worker = DeleteWorker(self.gh, whole, partial)
+        self.worker.log.connect(self.say)
+        self.worker.deleted.connect(self.on_deleted)
+        self.worker.finished_counts.connect(self.on_delete_finished)
+        self.worker.start()
+
+    def on_deleted(self, gist_id, name):
+        i, top = self.find_gist(gist_id)
+        if top is None:
+            return
+        if name is None:
+            self.gist_tree.takeTopLevelItem(i)
+        else:
+            for j in range(top.childCount()):
+                if top.child(j).data(0, Qt.UserRole)["name"] == name:
+                    top.removeChild(top.child(j))
+                    break
+        self.update_gist_count()
+
+    def on_delete_finished(self, ok, failed):
+        self.set_busy(False)
+        self.say(f"Delete done: {ok} deleted, {failed} failed.")
+        self.statusBar().showMessage(f"{ok} deleted, {failed} failed")
 
 
 def main():

@@ -21,6 +21,16 @@ The token needs the `gist` and `repo` scopes (a classic PAT, or the token from `
 2. Right: pick a repo (private-only by default), then a folder, or type a new folder path.
 3. Optional: overwrite existing files, remove each file from its gist after copying.
 4. **Move checked files.** Each file becomes one commit on the repo's default branch.
+   With "Submit as a pull request" ticked, the files go to a new `gist-move-<timestamp>` branch and a
+   PR is opened against the default branch (a clickable link appears under the Move button; there is
+   also an "Open repo on GitHub" link under the repo list). Gist removal is disabled in PR mode, since
+   the files only exist in the PR until it is merged.
+
+## Deleting
+
+**Delete checked...** (next to Reload) permanently deletes the checked files from their gists. If every
+file in a gist is checked, the whole gist is deleted. A confirmation lists exactly what will go, and
+filtered-out (hidden) files are never included. Deleted gists cannot be restored.
 
 ## Notes
 
