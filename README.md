@@ -26,6 +26,13 @@ The token needs the `gist` and `repo` scopes (a classic PAT, or the token from `
    also an "Open repo on GitHub" link under the repo list). Gist removal is disabled in PR mode, since
    the files only exist in the PR until it is merged.
 
+## Viewing
+
+Right-click a file in the Gists list and choose **View Contents** to open it in a read-only window
+(monospace, with a Copy button; you can open several at once). Large files are cut off at 200,000
+characters, and binary files show their size instead. Right-clicking a gist or file also offers
+**Open gist on GitHub**.
+
 ## Deleting
 
 **Delete checked...** (next to Reload) permanently deletes the checked files from their gists. If every
