@@ -36,7 +36,11 @@ mkdir -p "$APPDIR/usr/bin" "$APPDIR/usr/share/applications" "$APPDIR/usr/share/i
 cp -a dist/gist-mover/. "$APPDIR/usr/bin/"
 cp "$HERE/gist-mover.desktop" "$APPDIR/gist-mover.desktop"
 cp "$HERE/gist-mover.desktop" "$APPDIR/usr/share/applications/"
-./venv/bin/python "$HERE/make_icon.py" "$APPDIR/gist-mover.png"
+./venv/bin/python "$HERE/make_icon.py" "$APPDIR/gist-mover.png" || {
+    echo "ERROR: could not generate the icon. Qt needs the system OpenGL libraries; on a bare" >&2
+    echo "       Debian/Ubuntu machine install them with: sudo apt install libegl1 libgl1" >&2
+    exit 1
+}
 cp "$APPDIR/gist-mover.png" "$APPDIR/usr/share/icons/hicolor/256x256/apps/gist-mover.png"
 ln -sf gist-mover.png "$APPDIR/.DirIcon"
 cat > "$APPDIR/AppRun" <<'APPRUN'
