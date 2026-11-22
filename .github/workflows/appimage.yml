@@ -46,6 +46,22 @@ jobs:
           echo "exit code: $rc"
           [ "$rc" -eq 124 ]
 
+      - name: Diagnose smoke-test failure
+        if: failure()
+        run: |
+          # Show which libraries the Qt X11 plugin cannot resolve from inside the AppImage.
+          rm -rf squashfs-root
+          ./Gist-Mover-x86_64.AppImage --appimage-extract >/dev/null
+          P=$(find squashfs-root -name libqxcb.so | head -1)
+          echo "plugin: $P"
+          echo "--- unresolved libraries (empty = none):"
+          LD_LIBRARY_PATH=squashfs-root/usr/bin ldd "$P" | grep "not found" || true
+          echo "--- libxcb-cursor in the bundle:"
+          ls -la squashfs-root/usr/bin | grep -i "xcb-cursor" || echo "NOT BUNDLED"
+          echo "--- Qt plugin load error:"
+          GITHUB_TOKEN=invalid QT_DEBUG_PLUGINS=1 timeout 15 xvfb-run -a \
+            ./Gist-Mover-x86_64.AppImage --appimage-extract-and-run 2>&1 | grep -iE "xcb|cannot|error|not found" | head -15 || true
+
       - name: Checksum
         run: sha256sum Gist-Mover-x86_64.AppImage > Gist-Mover-x86_64.AppImage.sha256
 
