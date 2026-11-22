@@ -36,7 +36,11 @@ mkdir -p "$APPDIR/usr/bin" "$APPDIR/usr/share/applications" "$APPDIR/usr/share/i
 cp -a dist/gist-mover/. "$APPDIR/usr/bin/"
 cp "$HERE/gist-mover.desktop" "$APPDIR/gist-mover.desktop"
 cp "$HERE/gist-mover.desktop" "$APPDIR/usr/share/applications/"
-./venv/bin/python "$HERE/make_icon.py" "$APPDIR/gist-mover.png"
+./venv/bin/python "$HERE/make_icon.py" "$APPDIR/gist-mover.png" || {
+    echo "ERROR: could not generate the icon. Qt needs the system OpenGL libraries; on a bare" >&2
+    echo "       Debian/Ubuntu machine install them with: sudo apt install libegl1 libgl1" >&2
+    exit 1
+}
 cp "$APPDIR/gist-mover.png" "$APPDIR/usr/share/icons/hicolor/256x256/apps/gist-mover.png"
 ln -sf gist-mover.png "$APPDIR/.DirIcon"
 cat > "$APPDIR/AppRun" <<'APPRUN'
@@ -59,6 +63,22 @@ if [ -z "$CURSOR" ]; then
 fi
 [ -n "$CURSOR" ] || { echo "ERROR: cannot find libxcb-cursor.so.0. Install it (apt install libxcb-cursor0) and re-run."; exit 1; }
 cp -L "$CURSOR" "$APPDIR/usr/bin/libxcb-cursor.so.0"
+
+# PyInstaller only bundles the libraries that are installed on THIS machine. If any library the Qt
+# X11 plugin needs is missing here, the AppImage would silently fail to start elsewhere, so check.
+echo "==> Checking that the bundled Qt X11 plugin has every library it needs"
+XCB="$(find "$APPDIR/usr/bin" -name libqxcb.so | head -1)"
+[ -n "$XCB" ] || { echo "ERROR: Qt X11 plugin (libqxcb.so) not found in the bundle." >&2; exit 1; }
+MISSING="$(LD_LIBRARY_PATH="$APPDIR/usr/bin" ldd "$XCB" | awk '/not found/{print $1}' | sort -u)"
+if [ -n "$MISSING" ]; then
+    echo "ERROR: the Qt X11 plugin needs libraries that are not installed on this build machine:" >&2
+    echo "$MISSING" | sed 's/^/         /' >&2
+    echo "       On Debian/Ubuntu/Mint install them, then re-run this script:" >&2
+    echo "         sudo apt install libxkbcommon-x11-0 libxcb-icccm4 libxcb-image0 libxcb-keysyms1 \\" >&2
+    echo "              libxcb-randr0 libxcb-render-util0 libxcb-shape0 libxcb-sync1 libxcb-xfixes0 \\" >&2
+    echo "              libxcb-xkb1 libxcb-cursor0 libegl1 libgl1" >&2
+    exit 1
+fi
 
 echo "==> Fetching appimagetool"
 TOOL="$BUILD/appimagetool"

@@ -19,14 +19,22 @@ jobs:
     # and Ubuntu 22.04+. If GitHub retires this runner image, switch to ubuntu-24.04 (Mint 22+).
     runs-on: ubuntu-22.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Install system packages
         run: |
           sudo apt-get update
           # libxcb-cursor0: required by Qt 6 on X11; build_appimage.sh bundles it into the AppImage.
           # xvfb: virtual display for the smoke test below.
-          sudo apt-get install -y libxcb-cursor0 xvfb
+          # libegl1 / libgl1 (+ the rest): the runner image lacks them, and importing PySide6.QtGui
+          # (icon generation, and the app itself in the smoke test) fails without libEGL.so.1.
+          # These are not bundled into the AppImage on purpose: every desktop has them.
+          # The libxcb-* / libxkbcommon-x11 packages are what Qt's X11 plugin links against;
+          # PyInstaller bundles whatever is installed here, so they must be present at build time.
+          sudo apt-get install -y libxcb-cursor0 xvfb \
+            libegl1 libgl1 libopengl0 libxkbcommon0 libfontconfig1 libdbus-1-3 \
+            libxkbcommon-x11-0 libxcb-icccm4 libxcb-image0 libxcb-keysyms1 libxcb-randr0 \
+            libxcb-render-util0 libxcb-shape0 libxcb-sync1 libxcb-xfixes0 libxcb-xkb1
 
       - name: Build AppImage
         run: ./packaging/build_appimage.sh
@@ -42,11 +50,27 @@ jobs:
           echo "exit code: $rc"
           [ "$rc" -eq 124 ]
 
+      - name: Diagnose smoke-test failure
+        if: failure()
+        run: |
+          # Show which libraries the Qt X11 plugin cannot resolve from inside the AppImage.
+          rm -rf squashfs-root
+          ./Gist-Mover-x86_64.AppImage --appimage-extract >/dev/null
+          P=$(find squashfs-root -name libqxcb.so | head -1)
+          echo "plugin: $P"
+          echo "--- unresolved libraries (empty = none):"
+          LD_LIBRARY_PATH=squashfs-root/usr/bin ldd "$P" | grep "not found" || true
+          echo "--- libxcb-cursor in the bundle:"
+          ls -la squashfs-root/usr/bin | grep -i "xcb-cursor" || echo "NOT BUNDLED"
+          echo "--- Qt plugin load error:"
+          GITHUB_TOKEN=invalid QT_DEBUG_PLUGINS=1 timeout 15 xvfb-run -a \
+            ./Gist-Mover-x86_64.AppImage --appimage-extract-and-run 2>&1 | grep -iE "xcb|cannot|error|not found" | head -15 || true
+
       - name: Checksum
         run: sha256sum Gist-Mover-x86_64.AppImage > Gist-Mover-x86_64.AppImage.sha256
 
       - name: Upload workflow artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: Gist-Mover-AppImage
           path: |
