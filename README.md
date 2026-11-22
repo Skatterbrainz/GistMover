@@ -48,3 +48,30 @@ filtered-out (hidden) files are never included. Deleted gists cannot be restored
 - A file already in the repo with identical content counts as copied (so re-running cleans up the gist);
   one that exists but differs is skipped and kept in the gist unless you tick Overwrite.
 - Files are copied from the gist's latest version.
+
+## AppImage (run on other Linux machines without Python or a venv)
+
+Build (once, on a machine with python3 and internet access):
+
+```bash
+./packaging/build_appimage.sh
+```
+
+This creates `Gist-Mover-x86_64.AppImage` (about 70 MB) in the repo folder. Copy that single file to
+any other machine, then:
+
+```bash
+chmod +x Gist-Mover-x86_64.AppImage
+./Gist-Mover-x86_64.AppImage
+```
+
+Notes:
+- It is built against the glibc of the machine that built it. Build on Linux Mint 22 / Ubuntu 24.04
+  and it runs on Mint 22 and newer; for older distros, build on the oldest one you need.
+- AppImages need FUSE 2. If it won't start, run `sudo apt install libfuse2t64`, or launch it with
+  `./Gist-Mover-x86_64.AppImage --appimage-extract-and-run`.
+- Authentication is unchanged: set `GITHUB_TOKEN`, or install `gh` and run `gh auth login`, or paste a
+  token when prompted. A launcher started from the menu does not see variables from `.bashrc`, so
+  `gh auth login` is the easiest route.
+- For a menu entry, copy the AppImage somewhere permanent (e.g. `~/Applications`) and create
+  `~/.local/share/applications/gist-mover.desktop` with `Exec=/full/path/Gist-Mover-x86_64.AppImage`.
