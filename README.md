@@ -10,6 +10,17 @@ pip install -r requirements.txt
 python gist_mover.py
 ```
 
+Run it once like this to set up, or skip all of this and use the [AppImage](#appimage-run-on-other-linux-machines-without-python-or-a-venv).
+If Qt reports `Could not load the Qt platform plugin "xcb"`, install the missing library with
+`sudo apt install libxcb-cursor0`.
+
+### Desktop launcher script
+
+`run_gist_mover.sh` starts the app from this folder using the `venv` above, adds `~/.local/bin` and
+`/usr/local/bin` to `PATH` (so the app can find `gh`), and appends all output to
+`~/.cache/gist_mover.log`, the first place to look when a menu launcher "does nothing". Point a
+`.desktop` file at it with an absolute path: `Exec=/full/path/to/run_gist_mover.sh`.
+
 ## Auth
 
 Uses, in order: `GITHUB_TOKEN` / `GH_TOKEN`, the output of `gh auth token`, or a prompt.
@@ -53,11 +64,20 @@ filtered-out (hidden) files are never included. Deleted gists cannot be restored
 
 ### Download a prebuilt AppImage
 
-Tagged versions are built automatically by GitHub Actions (`.github/workflows/appimage.yml`) and
-attached to the repo's **Releases** page, along with a `.sha256` checksum. Download
-`Gist-Mover-x86_64.AppImage`, `chmod +x` it, and run it. Nothing else to install.
+Tagged versions (`v1.0.0`, ...) are built automatically by GitHub Actions
+(`.github/workflows/appimage.yml`) and attached to the repo's **Releases** page, along with a `.sha256`
+checksum. Download `Gist-Mover-x86_64.AppImage`, then:
 
-These builds use Ubuntu 22.04, so they run on Linux Mint 21 / Ubuntu 22.04 and newer.
+```bash
+chmod +x Gist-Mover-x86_64.AppImage
+./Gist-Mover-x86_64.AppImage
+```
+
+No Python, venv or Qt install is needed. See [AppImage requirements](#appimage-requirements) below for
+the few things the host still needs (FUSE 2, and `gh` or a token for login).
+
+These builds are made on Ubuntu 22.04, so they run on Linux Mint 21 / Ubuntu 22.04 and newer. They are
+x86_64 only.
 
 To publish a new version (maintainer):
 
@@ -71,27 +91,38 @@ To try a build without making a release, open the **Actions** tab, choose **Buil
 
 ### Build it yourself
 
-Build (once, on a machine with python3 and internet access):
+Needs python3 (with the `venv` module) and internet access. Run it once:
 
 ```bash
 ./packaging/build_appimage.sh
 ```
 
-This creates `Gist-Mover-x86_64.AppImage` (about 70 MB) in the repo folder. Copy that single file to
-any other machine, then:
+The script builds in its own temporary venv, bundles the app with PyInstaller, and writes
+`Gist-Mover-x86_64.AppImage` (roughly 60-70 MB) into the repo folder. Copy that single file to any other
+machine.
+
+PyInstaller bundles only the libraries installed on the build machine, so the script checks that the
+bundled Qt X11 plugin has everything it needs and stops with an `apt install` hint if not. On a bare
+Debian/Ubuntu/Mint machine, install these first:
 
 ```bash
-chmod +x Gist-Mover-x86_64.AppImage
-./Gist-Mover-x86_64.AppImage
+sudo apt install libegl1 libgl1 libxkbcommon-x11-0 libxcb-cursor0 libxcb-icccm4 libxcb-image0 \
+  libxcb-keysyms1 libxcb-randr0 libxcb-render-util0 libxcb-shape0 libxcb-sync1 libxcb-xfixes0 libxcb-xkb1
 ```
 
-Notes:
-- It is built against the glibc of the machine that built it. Build on Linux Mint 22 / Ubuntu 24.04
-  and it runs on Mint 22 and newer; for older distros, build on the oldest one you need.
-- AppImages need FUSE 2. If it won't start, run `sudo apt install libfuse2t64`, or launch it with
+The AppImage is built against the glibc of the machine that built it, so it runs on that distro version
+and newer. Build on Mint 22 / Ubuntu 24.04 and it runs on Mint 22 and newer; to support older systems,
+build on the oldest one you need.
+
+### AppImage requirements
+
+For a downloaded or a self-built AppImage:
+- **FUSE 2** is needed to run any AppImage: `sudo apt install libfuse2t64` on Mint 22 / Ubuntu 24.04, or
+  `sudo apt install libfuse2` on Mint 21 / Ubuntu 22.04. Without it, launch with
   `./Gist-Mover-x86_64.AppImage --appimage-extract-and-run`.
-- Authentication is unchanged: set `GITHUB_TOKEN`, or install `gh` and run `gh auth login`, or paste a
+- **Display:** it runs through Qt's X11 (xcb) platform and has only been tested on X11.
+- **Authentication** is unchanged: set `GITHUB_TOKEN`, or install `gh` and run `gh auth login`, or paste a
   token when prompted. A launcher started from the menu does not see variables from `.bashrc`, so
   `gh auth login` is the easiest route.
-- For a menu entry, copy the AppImage somewhere permanent (e.g. `~/Applications`) and create
+- **Menu entry:** copy the AppImage somewhere permanent (e.g. `~/Applications`) and create
   `~/.local/share/applications/gist-mover.desktop` with `Exec=/full/path/Gist-Mover-x86_64.AppImage`.
