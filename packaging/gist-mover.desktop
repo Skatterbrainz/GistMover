@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=Gist Mover
+Comment=Move GitHub gist files into repos
+Exec=gist-mover
+Icon=gist-mover
+Terminal=false
+Categories=Development;Utility;
