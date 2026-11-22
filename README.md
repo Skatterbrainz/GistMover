@@ -51,6 +51,26 @@ filtered-out (hidden) files are never included. Deleted gists cannot be restored
 
 ## AppImage (run on other Linux machines without Python or a venv)
 
+### Download a prebuilt AppImage
+
+Tagged versions are built automatically by GitHub Actions (`.github/workflows/appimage.yml`) and
+attached to the repo's **Releases** page, along with a `.sha256` checksum. Download
+`Gist-Mover-x86_64.AppImage`, `chmod +x` it, and run it. Nothing else to install.
+
+These builds use Ubuntu 22.04, so they run on Linux Mint 21 / Ubuntu 22.04 and newer.
+
+To publish a new version (maintainer):
+
+```bash
+git tag v1.0.0
+git push origin v1.0.0
+```
+
+To try a build without making a release, open the **Actions** tab, choose **Build AppImage**, and use
+**Run workflow**; the AppImage appears as a downloadable artifact on that run.
+
+### Build it yourself
+
 Build (once, on a machine with python3 and internet access):
 
 ```bash
